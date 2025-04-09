@@ -1,0 +1,101 @@
+import pandas as pd             # version 2.2.2
+import numpy as np              # version 2.0.2
+import matplotlib.pyplot as plt
+import pandas.api.types as ptypes
+import xgboost as xgb
+from sklearn.metrics import mean_squared_error
+
+# Load the prepared dataset
+df_prepared = pd.read_csv('Prepared.csv')
+
+# Cast 'month' as datetime type, if not, before extracting 'years' from datetime to numerical
+if not ptypes.is_datetime64_any_dtype(df_prepared['month']):
+  df_prepared['month'] = pd.to_datetime(df_prepared['month'], utc=True).dt.tz_localize(None)
+df_prepared['years'] = df_prepared['month'].dt.year
+
+# Create a feature that counts the number of months from baseline of the earliest month (Jan 2017), as the models cannot accept datetime data type
+df_prepared['months'] = ((df_prepared['month'].dt.year - df_prepared['month'].min().year) * 12 + (df_prepared['month'].dt.month - df_prepared['month'].min().month))
+
+# Drop the original datetime column since we already have the count of number of months
+df_prepared = df_prepared.drop(columns=['month'], axis=1)
+
+# Convert distance from km to m then convert all features to 'int32' data type for easier working with numpy array later
+df_prepared['distance_km'] = df_prepared['distance_km'] * 1000
+df_prepared = df_prepared.astype('int32')
+
+df_prepared.info(), df_prepared.head()
+
+df_XGBoost = df_prepared.copy()           # Make a copy of the prepared dataset
+
+# Define features (X) and target variable (y)
+X = df_XGBoost.drop(columns=['resale_price'])
+y = df_XGBoost['resale_price']
+
+# Split: First 6 years (85% training), Last 1.2 years (15% testing)
+train_size = int(0.85 * len(df_XGBoost))  # 85% training, 15% testing
+X_train, X_test = X.iloc[:train_size], X.iloc[train_size:]
+y_train, y_test = y.iloc[:train_size], y.iloc[train_size:]
+val_size = int(0.85 * len(X_train))       # further split 85% training, 15% validation
+X_train, X_val = X_train.iloc[:val_size], X_train.iloc[val_size:]
+y_train, y_val = y_train.iloc[:val_size], y_train.iloc[val_size:]
+
+# Initialize XGBoost model
+xgb_model = xgb.XGBRegressor(
+    objective='reg:squarederror',
+    n_estimators=1300,
+    learning_rate=0.075,
+    max_depth=7,
+    subsample=0.8,
+    colsample_bytree=0.9,
+    gamma=0.2,
+    reg_alpha=10,
+    reg_lambda=2,
+    min_child_weight=5,
+    random_state=48,
+    eval_metric='rmse',
+    early_stopping_rounds=80
+)
+
+# Train model
+xgb_model.fit(X_train, y_train, eval_set=[(X_train, y_train), (X_val, y_val)], verbose=False)
+
+# Predict on both the training and test data
+y_train_pred = xgb_model.predict(X_train)
+y_test_pred = xgb_model.predict(X_test)
+
+# Store predictions in 'pred' for ensembling (average) with TabNet's predictions
+if 'pred' not in locals():
+  pred = pd.DataFrame()
+pred["xgb"] = pd.Series(y_test_pred.flatten())
+
+# Calculate RMSE for both training and test data
+train_rmse = np.sqrt(mean_squared_error(y_train, y_train_pred))
+test_rmse = np.sqrt(mean_squared_error(y_test, y_test_pred))
+
+# Print RMSE values
+print(f"Training RMSE: {train_rmse}")
+print(f"Test RMSE: {test_rmse}")
+
+# Symmetric Mean Absolute Percentage Error (SMAPE)
+# SMAPE is an adjusted version of MAPE that accounts for the symmetry between over-predictions and under-predictions, which makes it a better option when actual values can be close to zero.
+def smape(y_true, y_pred):
+    return 100 * np.mean(2 * np.abs(y_pred - y_true) / (np.abs(y_true) + np.abs(y_pred)))
+
+print(f"SMAPE (train): {smape(y_train, y_train_pred):.2f}%")
+print(f"SMAPE (test): {smape(y_test, y_test_pred):.2f}%")
+
+# Plotting the training and test error (RMSE) curves for the training process
+results = xgb_model.evals_result()
+epochs = len(results['validation_0']['rmse'])
+
+plt.figure(figsize=(10, 6))
+plt.plot(range(epochs), results['validation_0']['rmse'], label='Training RMSE')
+plt.plot(range(epochs), results['validation_1']['rmse'], label='Validation RMSE')
+plt.xlabel('Boosting Rounds')
+plt.ylabel('RMSE')
+plt.legend()
+plt.title('Training vs. Validation RMSE')
+plt.show()
+
+# Save the model for later reuse
+xgb_model.save_model('xgboost.json')

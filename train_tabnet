@@ -1,0 +1,102 @@
+import pandas as pd             # version 2.2.2
+import numpy as np              # version 2.0.2
+import matplotlib.pyplot as plt
+import pandas.api.types as ptypes
+from pytorch_tabnet.tab_model import TabNetRegressor
+from sklearn.metrics import mean_squared_error
+import torch
+
+# Load the prepared dataset
+df_prepared = pd.read_csv('Prepared.csv')
+
+# Cast 'month' as datetime type, if not, before extracting 'years' from datetime to numerical
+if not ptypes.is_datetime64_any_dtype(df_prepared['month']):
+  df_prepared['month'] = pd.to_datetime(df_prepared['month'], utc=True).dt.tz_localize(None)
+df_prepared['years'] = df_prepared['month'].dt.year
+
+# Create a feature that counts the number of months from baseline of the earliest month (Jan 2017), as the models cannot accept datetime data type
+df_prepared['months'] = ((df_prepared['month'].dt.year - df_prepared['month'].min().year) * 12 + (df_prepared['month'].dt.month - df_prepared['month'].min().month))
+
+# Drop the original datetime column since we already have the count of number of months
+df_prepared = df_prepared.drop(columns=['month'], axis=1)
+
+# Convert distance from km to m then convert all features to 'int32' data type for easier working with numpy array later
+df_prepared['distance_km'] = df_prepared['distance_km'] * 1000
+df_prepared = df_prepared.astype('int32')
+
+df_prepared.info(), df_prepared.head()
+
+df_TabNet = df_prepared.copy()                # Make a copy of the prepared dataset
+
+# Define features (X) and target variable (y)
+X = df_TabNet.drop(columns=['resale_price'])
+y = df_TabNet['resale_price']
+
+# Split: First 6 years (85% training and validation), Last 1.2 years (15% testing)
+train_size = int(0.85 * len(df_TabNet))   # 85% training, 15% testing
+X_train, X_test = X.iloc[:train_size].to_numpy(), X.iloc[train_size:].to_numpy()      # convert to numpy array required for tabnet fit
+y_train, y_test = y.iloc[:train_size], y.iloc[train_size:]
+val_size = int(0.85 * len(X_train))       # further split 85% training, 15% validation
+X_train, X_val = X_train[:val_size], X_train[val_size:]                               # convert to numpy array required for tabnet fit
+y_train, y_val = y_train.iloc[:val_size], y_train.iloc[val_size:]
+
+# Convert y_train, y_val and y_test to numpy array and reshape to 2D
+y_train = y_train.values.reshape(-1, 1)
+y_val = y_val.values.reshape(-1, 1)
+y_test = y_test.values.reshape(-1, 1)
+
+# Initialize TabNet Regressor
+tabnet_model = TabNetRegressor(
+    n_d=64,                         # Number of decision steps
+    n_a=64,                         # Attention size
+    n_steps=5,                      # Number of attention steps
+    gamma=1.3,                      # Sparse regularization
+    lambda_sparse=0.001,            # Sparse regularization strength
+    optimizer_fn=torch.optim.Adam,
+    optimizer_params={'lr': 1e-2},
+    mask_type='sparsemax'           # Option for sparsemax activation
+)
+
+# Train the TabNet Regressor model
+tabnet_model.fit(
+    X_train, y_train,
+    eval_set=[(X_val, y_val)],
+    max_epochs=100, patience=10, batch_size=512, virtual_batch_size=128,
+    num_workers=0, drop_last=False
+)
+
+# Make predictions
+y_train_pred = tabnet_model.predict(X_train)
+y_test_pred = tabnet_model.predict(X_test)
+
+# Store predictions in 'pred' for ensembling (average) with XGBoost's predictions
+if 'pred' not in locals():
+  pred = pd.DataFrame()
+pred["tab"] = pd.Series(y_test_pred.flatten())
+
+# Calculate RMSE (Root Mean Squared Error)
+train_rmse = np.sqrt(mean_squared_error(y_train, y_train_pred))
+test_rmse = np.sqrt(mean_squared_error(y_test, y_test_pred))
+
+print(f"Training RMSE: {train_rmse}")
+print(f"Test RMSE: {test_rmse}")
+
+# Calculate SMAPE (Symmetric Mean Absolute Percentage Error)
+def smape(y_true, y_pred):
+    return 100 * np.mean(2 * np.abs(y_pred - y_true) / (np.abs(y_true) + np.abs(y_pred)))
+
+print(f"SMAPE (train): {smape(y_train, y_train_pred):.2f}%")
+print(f"SMAPE (test): {smape(y_test, y_test_pred):.2f}%")
+
+# Plot the training and test loss curves during the training process
+plt.figure(figsize=(10, 6))
+plt.plot(tabnet_model.history['loss'], label='Training Loss')
+plt.plot(tabnet_model.history['val_0_mse'], label='Mean Squared Error')
+plt.xlabel('Epochs')
+plt.ylabel('Loss')
+plt.legend()
+plt.title('Training vs. Validation Loss')
+plt.show()
+
+# Save the model for later reuse
+tabnet_model.save_model('tabnet_model')
